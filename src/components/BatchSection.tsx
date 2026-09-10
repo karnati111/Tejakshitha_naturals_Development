@@ -1,0 +1,1828 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { User } from 'firebase/auth';
+import {
+  ProductCatalogItem,
+  HarvestLog,
+  ProductionBatch,
+  FarmMember,
+  BatchStatus,
+  isQualityInspector,
+  isProductionLead,
+  canMarkBatchReady,
+  canUpdateQuality,
+  canStartProductionBatch,
+  isRawMaterialApproved,
+} from '../types';
+import {
+  createBatch,
+  addProgressReading,
+  updateBatchStatus,
+} from '../lib/farmService';
+import { formatUnitDisplay, formatQuantityWithUnit } from '../lib/unitUtils';
+import { BatchChatModal } from './BatchChatModal';
+import { BatchReadyModal } from './BatchReadyModal';
+import { BatchReadyPromptModal } from './BatchReadyPromptModal';
+import { QualityControlTimeline } from './QualityControlTimeline';
+import ReactMarkdown from 'react-markdown';
+import {
+  Boxes,
+  PlusCircle,
+  Sparkles,
+  Bot,
+  Layers,
+  Thermometer,
+  Droplets,
+  Clock,
+  CheckCircle2,
+  AlertCircle,
+  Loader2,
+  Calendar,
+  Send,
+  MessageSquare,
+  ShieldCheck,
+  ShieldAlert,
+  ChevronDown,
+  ChevronUp,
+  Activity,
+  FileText,
+  Truck,
+  ExternalLink,
+  ClipboardList,
+  ArrowRight,
+  Scale,
+} from 'lucide-react';
+
+interface BatchSectionProps {
+  farmId: string;
+  farmName: string;
+  user: User;
+  member: FarmMember;
+  products: ProductCatalogItem[];
+  harvestLogs: HarvestLog[];
+  batches: ProductionBatch[];
+  onBatchCreated: (newBatch: ProductionBatch) => void;
+  onBatchUpdated: (updatedBatch: ProductionBatch) => void;
+  preselectedProduct?: ProductCatalogItem | null;
+  preselectedLogs?: HarvestLog[];
+  onClearPreselection?: () => void;
+  onNavigateTab?: (tab: 'intake' | 'batches' | 'catalog' | 'history' | 'team') => void;
+  focusedBatchId?: string | null;
+  onClearFocusedBatch?: () => void;
+}
+
+export const BatchSection: React.FC<BatchSectionProps> = ({
+  farmId,
+  farmName,
+  user,
+  member,
+  products,
+  harvestLogs,
+  batches,
+  onBatchCreated,
+  onBatchUpdated,
+  preselectedProduct,
+  preselectedLogs = [],
+  onClearPreselection,
+  onNavigateTab,
+  focusedBatchId,
+  onClearFocusedBatch,
+}) => {
+  const [showCreateModal, setShowCreateModal] = useState(
+    !!preselectedProduct || preselectedLogs.length > 0
+  );
+
+  // Form State
+  const [selectedProductId, setSelectedProductId] = useState<string>(
+    preselectedProduct?.id || (products.length > 0 ? products[0].id : '')
+  );
+  const [selectedLogIds, setSelectedLogIds] = useState<string[]>(
+    preselectedLogs.map((l) => l.id)
+  );
+
+  // Specific quantity drawn per selected harvest log: { [logId: string]: number }
+  const [logAllocations, setLogAllocations] = useState<{ [logId: string]: number }>({});
+
+  // Helper to compute available remaining quantity for any harvest log
+  const getLogAvailableQuantity = (log: HarvestLog): number => {
+    if (log.remainingQuantity !== undefined) {
+      return Math.max(0, log.remainingQuantity);
+    }
+    const linkedBatches = batches.filter((b) => b.linkedHarvestLogIds?.includes(log.id));
+    const used = linkedBatches.reduce((acc, b) => {
+      const specific = b.intakeAllocations?.find((a) => a.harvestLogId === log.id)?.quantityUsed;
+      return acc + (specific !== undefined ? specific : (b.totalQuantity || 0));
+    }, 0);
+    return Math.max(0, log.quantity - used);
+  };
+
+  // Synchronize when incoming preselected props update
+  useEffect(() => {
+    if (preselectedProduct) {
+      setSelectedProductId(preselectedProduct.id);
+      setShowCreateModal(true);
+    }
+    if (preselectedLogs && preselectedLogs.length > 0) {
+      setSelectedLogIds(preselectedLogs.map((l) => l.id));
+      const initialAlloc: { [id: string]: number } = {};
+      preselectedLogs.forEach((l) => {
+        initialAlloc[l.id] =
+          l.remainingQuantity !== undefined ? l.remainingQuantity : getLogAvailableQuantity(l);
+      });
+      setLogAllocations((prev) => ({ ...prev, ...initialAlloc }));
+      if (preselectedLogs[0]?.productId) {
+        setSelectedProductId(preselectedLogs[0].productId);
+      }
+      setShowCreateModal(true);
+    }
+  }, [preselectedProduct, preselectedLogs]);
+
+  // Expand and highlight focused batch if navigated from Intake view
+  useEffect(() => {
+    if (focusedBatchId) {
+      setExpandedBatchId(focusedBatchId);
+      setTimeout(() => {
+        const el = document.getElementById(`batch-${focusedBatchId}`);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }, 150);
+    }
+  }, [focusedBatchId]);
+
+  // Environmental conditions
+  const [temperature, setTemperature] = useState('50°C - 55°C (Chamber)');
+  const [humidity, setHumidity] = useState('Below 25% RH');
+  const [method, setMethod] = useState('Multi-tray cabinet dehydrator');
+  const [duration, setDuration] = useState('24 - 36 hours');
+  const [targetCriteria, setTargetCriteria] = useState(
+    'Crisp snap test, residual moisture < 7%, vibrant natural color'
+  );
+  const [customNotes, setCustomNotes] = useState('');
+
+  // AI Generation State
+  const [generatedSchedule, setGeneratedSchedule] = useState<string>('');
+  const [scheduleModelUsed, setScheduleModelUsed] = useState<string>('');
+  const [isGeneratingAI, setIsGeneratingAI] = useState(false);
+  const [isCreatingBatch, setIsCreatingBatch] = useState(false);
+  const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
+    null
+  );
+
+  // Active Batch Details & Chat Modal State
+  const [activeChatBatch, setActiveChatBatch] = useState<ProductionBatch | null>(null);
+  const [expandedBatchId, setExpandedBatchId] = useState<string | null>(null);
+  const [viewingScheduleBatch, setViewingScheduleBatch] = useState<ProductionBatch | null>(null);
+
+  // Ready Status Transition & Next Steps Modal
+  const [readyModalData, setReadyModalData] = useState<{
+    batch: ProductionBatch;
+    slackNotified: boolean;
+  } | null>(null);
+
+  // Status Filter for batch overview ('all' | 'processing' | 'ready' | 'packaged')
+  const [statusFilter, setStatusFilter] = useState<'all' | 'processing' | 'ready' | 'packaged'>('all');
+
+  // Original Dried Leaf Weight Stock Entry Modal State
+  const [promptBatch, setPromptBatch] = useState<ProductionBatch | null>(null);
+  const [isSubmittingPromptReady, setIsSubmittingPromptReady] = useState(false);
+
+  // Progress Reading sub-state per batch
+  const [newReadingNote, setNewReadingNote] = useState<{ [batchId: string]: string }>({});
+  const [newReadingMetric, setNewReadingMetric] = useState<{ [batchId: string]: string }>({});
+  const [isSubmittingReading, setIsSubmittingReading] = useState<{ [batchId: string]: boolean }>({});
+
+  // Status update loading state
+  const [isUpdatingStatus, setIsUpdatingStatus] = useState<{ [batchId: string]: boolean }>({});
+
+  const selectedProduct = products.find((p) => p.id === selectedProductId);
+
+  // Derived filtered batch collections for operational oversight
+  const processingBatches = useMemo(() => batches.filter((b) => b.status === 'processing'), [batches]);
+  const readyBatches = useMemo(() => batches.filter((b) => b.status === 'ready'), [batches]);
+  const packagedBatches = useMemo(() => batches.filter((b) => b.status === 'packaged'), [batches]);
+
+  // Aggregate available raw material across all unallocated intake logs
+  const availableRawMaterials = useMemo(() => {
+    let totalAvailable = 0;
+    const byProduct: Record<string, { productName: string; availableQty: number; unit: string }> = {};
+
+    harvestLogs.forEach((log) => {
+      const avail = getLogAvailableQuantity(log);
+      if (avail > 0) {
+        totalAvailable += avail;
+        const pName = log.productName || 'Raw Harvest Item';
+        if (!byProduct[log.productId]) {
+          byProduct[log.productId] = { productName: pName, availableQty: 0, unit: log.unit || 'kg' };
+        }
+        byProduct[log.productId].availableQty += avail;
+      }
+    });
+
+    return {
+      totalAvailable: Math.round(totalAvailable * 100) / 100,
+      byProduct,
+      hasAvailableStock: totalAvailable > 0,
+    };
+  }, [harvestLogs, batches]);
+
+  // Filtered batches for display
+  const filteredBatches = useMemo(() => {
+    if (statusFilter === 'all') return batches;
+    return batches.filter((b) => b.status === statusFilter);
+  }, [batches, statusFilter]);
+
+  // Compute set of harvest log IDs that have zero remaining stock
+  const exhaustedHarvestLogIds = useMemo(() => {
+    const set = new Set<string>();
+    harvestLogs.forEach((l) => {
+      if (getLogAvailableQuantity(l) <= 0) {
+        set.add(l.id);
+      }
+    });
+    return set;
+  }, [harvestLogs, batches]);
+
+  // Available harvest logs for the selected product
+  const availableLogs = useMemo(() => {
+    return harvestLogs.filter((l) => l.productId === selectedProductId);
+  }, [harvestLogs, selectedProductId]);
+
+  // Unallocated logs (fresh intake deliveries or deliveries with remaining unallocated stock)
+  const unallocatedLogs = useMemo(() => {
+    return availableLogs.filter((l) => !exhaustedHarvestLogIds.has(l.id));
+  }, [availableLogs, exhaustedHarvestLogIds]);
+
+  // Calculate total quantity strictly from selected logs and their allocated draw amounts
+  const calculatedQuantity = useMemo(() => {
+    return selectedLogIds.reduce((sum, logId) => {
+      const log = harvestLogs.find((l) => l.id === logId);
+      if (!log) return sum;
+      const maxAvailable = getLogAvailableQuantity(log);
+      const allocated =
+        logAllocations[logId] !== undefined ? logAllocations[logId] : maxAvailable;
+      return sum + Math.max(0, Math.min(maxAvailable, Number(allocated) || 0));
+    }, 0);
+  }, [selectedLogIds, logAllocations, harvestLogs, batches]);
+
+  // Handle product dropdown change with intake awareness
+  const handleProductChange = (newProdId: string) => {
+    setSelectedProductId(newProdId);
+    const logsForNewProd = harvestLogs.filter((l) => l.productId === newProdId);
+    // Auto-select logs with remaining unallocated stock that have received QC approval
+    const freshLogs = logsForNewProd.filter(
+      (l) => getLogAvailableQuantity(l) > 0 && isRawMaterialApproved(l)
+    );
+    if (freshLogs.length > 0) {
+      setSelectedLogIds(freshLogs.map((l) => l.id));
+      const initialAlloc: { [id: string]: number } = {};
+      freshLogs.forEach((l) => {
+        initialAlloc[l.id] = getLogAvailableQuantity(l);
+      });
+      setLogAllocations((prev) => ({ ...prev, ...initialAlloc }));
+    } else {
+      setSelectedLogIds([]);
+    }
+    setGeneratedSchedule('');
+  };
+
+  // Generate AI Schedule using Gemini with Resilient Fallback Ladder
+  const handleGenerateAISchedule = async () => {
+    if (!selectedProduct) return;
+    setIsGeneratingAI(true);
+    setFeedback(null);
+
+    try {
+      const response = await fetch('/api/batches/generate-schedule', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          productName: selectedProduct.name,
+          processingType: selectedProduct.processingType,
+          conditions: {
+            temperature,
+            humidity,
+            method,
+            duration,
+            targetCriteria,
+            customNotes,
+          },
+        }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.details || data.error || 'Schedule generation failed');
+      }
+
+      setGeneratedSchedule(data.schedule);
+      setScheduleModelUsed(data.modelUsed || 'gemini-3.6-flash');
+      setFeedback({
+        type: 'success',
+        message: `Schedule generated successfully with ${data.modelUsed || 'Gemini'}!`,
+      });
+    } catch (err: any) {
+      console.error('Error generating AI schedule:', err);
+      setFeedback({
+        type: 'error',
+        message: err?.message || 'Could not generate schedule from Gemini API.',
+      });
+    } finally {
+      setIsGeneratingAI(false);
+    }
+  };
+
+  // Create Batch
+  const handleCreateBatch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedProduct) return;
+
+    // Strict Requirement: A batch CANNOT be started without raw material intake update!
+    if (selectedLogIds.length === 0 || calculatedQuantity <= 0) {
+      setFeedback({
+        type: 'error',
+        message:
+          'Raw material intake update required: You must link at least one raw material delivery record with allocated quantity > 0 before launching a production batch.',
+      });
+      return;
+    }
+
+    // Quality Inspector Gate: Raw material must have QC approval
+    const unapprovedLog = selectedLogIds
+      .map((id) => harvestLogs.find((l) => l.id === id))
+      .find((log) => log && !isRawMaterialApproved(log));
+
+    if (unapprovedLog) {
+      setFeedback({
+        type: 'error',
+        message: `Quality Gate Enforced: Raw material lot #${unapprovedLog.id.slice(-6)} (${unapprovedLog.productName}) has not received QC approval (status: ${unapprovedLog.qcStatus || 'pending_qc'}). Only QC-certified raw material can be processed.`,
+      });
+      return;
+    }
+
+    setFeedback(null);
+    setIsCreatingBatch(true);
+
+    // Build structured intake allocations array
+    const intakeAllocations = selectedLogIds.map((logId) => {
+      const log = harvestLogs.find((l) => l.id === logId);
+      const maxAvailable = log ? getLogAvailableQuantity(log) : 0;
+      const allocatedAmt =
+        logAllocations[logId] !== undefined ? logAllocations[logId] : maxAvailable;
+      return {
+        harvestLogId: logId,
+        quantityUsed: Math.max(0, Math.min(maxAvailable, Number(allocatedAmt) || 0)),
+      };
+    });
+
+    try {
+      const batchData = {
+        productId: selectedProduct.id,
+        productName: selectedProduct.name,
+        processingType: selectedProduct.processingType,
+        linkedHarvestLogIds: selectedLogIds,
+        intakeAllocations,
+        totalQuantity: calculatedQuantity,
+        unit: selectedProduct.unit,
+        conditions: {
+          temperature,
+          humidity,
+          method,
+          duration,
+          targetCriteria,
+          customNotes,
+        },
+        schedule: generatedSchedule || 'Standard processing schedule initialized.',
+        scheduleModelUsed: scheduleModelUsed || 'gemini-3.6-flash',
+      };
+
+      const newBatchId = await createBatch(farmId, batchData);
+      const createdBatchObj: ProductionBatch = {
+        id: newBatchId,
+        ...batchData,
+        status: 'processing',
+        progressReadings: [],
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      onBatchCreated(createdBatchObj);
+      setShowCreateModal(false);
+      if (onClearPreselection) onClearPreselection();
+      setFeedback({
+        type: 'success',
+        message: `Batch #${newBatchId.slice(-6)} (${selectedProduct.name}) launched with ${calculatedQuantity} ${selectedProduct.unit} allocated from raw material intake!`,
+      });
+    } catch (err: any) {
+      console.error('Error creating batch:', err);
+      setFeedback({
+        type: 'error',
+        message: err?.message || 'Failed to create production batch in Firestore.',
+      });
+    } finally {
+      setIsCreatingBatch(false);
+    }
+  };
+
+  // Add progress reading (Workers & Admins permitted)
+  const handleAddReading = async (batch: ProductionBatch) => {
+    const note = (newReadingNote[batch.id] || '').trim();
+    const metric = (newReadingMetric[batch.id] || '').trim();
+    if (!note) return;
+
+    setIsSubmittingReading((prev) => ({ ...prev, [batch.id]: true }));
+    try {
+      await addProgressReading(farmId, batch.id, batch.progressReadings || [], {
+        note,
+        metric: metric || 'Observation',
+        loggedByUid: user.uid,
+        loggedByName: user.displayName || user.email || 'Team Member',
+        loggedByRole: member.roleLabel || member.permissionTier,
+      });
+
+      const updatedReadings = [
+        ...(batch.progressReadings || []),
+        {
+          id: 'read_' + Date.now(),
+          timestamp: new Date().toISOString(),
+          note,
+          metric: metric || 'Observation',
+          loggedByUid: user.uid,
+          loggedByName: user.displayName || user.email || 'Team Member',
+          loggedByRole: member.roleLabel || member.permissionTier,
+        },
+      ];
+
+      onBatchUpdated({ ...batch, progressReadings: updatedReadings });
+      setNewReadingNote((prev) => ({ ...prev, [batch.id]: '' }));
+      setNewReadingMetric((prev) => ({ ...prev, [batch.id]: '' }));
+    } catch (err: any) {
+      console.error('Error adding progress reading:', err);
+      alert('Could not save progress reading.');
+    } finally {
+      setIsSubmittingReading((prev) => ({ ...prev, [batch.id]: false }));
+    }
+  };
+
+  // Status transition handler
+  // - 'ready': Admin, Quality Inspector, and Production Lead all have authority
+  // - 'packaged': Admin authority
+  const handleStatusChange = async (batch: ProductionBatch, targetStatus: BatchStatus) => {
+    // If transitioning to ready, verify Quality Inspector, Production Lead, or Admin authority
+    if (targetStatus === 'ready') {
+      const authorized = canMarkBatchReady(member.roleLabel, member.permissionTier);
+      if (!authorized) {
+        setFeedback({
+          type: 'error',
+          message: 'Access Denied: Quality Inspector, Production Lead, or Admin authority required to mark a batch Ready.',
+        });
+        return;
+      }
+      setPromptBatch(batch);
+      return;
+    }
+
+    // If transitioning to packaged, verify Admin authority
+    if (targetStatus === 'packaged') {
+      if (member.permissionTier !== 'admin') {
+        setFeedback({
+          type: 'error',
+          message: 'Access Denied: Only Admins can mark a batch Packaged.',
+        });
+        return;
+      }
+    }
+
+    setIsUpdatingStatus((prev) => ({ ...prev, [batch.id]: true }));
+    try {
+      // Update Firestore status
+      await updateBatchStatus(farmId, batch.id, targetStatus);
+
+      const updatedBatch: ProductionBatch = {
+        ...batch,
+        status: targetStatus,
+        readyAt: batch.readyAt,
+        updatedAt: new Date(),
+      };
+
+      onBatchUpdated(updatedBatch);
+    } catch (err: any) {
+      console.error('Error updating status:', err);
+      setFeedback({
+        type: 'error',
+        message: 'Failed to update batch status: ' + (err?.message || 'Server error'),
+      });
+    } finally {
+      setIsUpdatingStatus((prev) => ({ ...prev, [batch.id]: false }));
+    }
+  };
+
+  // Confirm handler for Original Dried Leaf Weight Prompt
+  const handleConfirmReadyPrompt = async (payload: {
+    driedOutputQuantity: number;
+    driedOutputUnit: string;
+    gradeAOutputQuantity?: number;
+    gradeBOutputQuantity?: number;
+    notes?: string;
+  }) => {
+    if (!promptBatch) return;
+    setIsSubmittingPromptReady(true);
+    try {
+      const result = await updateBatchStatus(farmId, promptBatch.id, 'ready', user.uid, {
+        notes: payload.notes,
+        driedOutputQuantity: payload.driedOutputQuantity,
+        driedOutputUnit: payload.driedOutputUnit,
+        gradeAOutputQuantity: payload.gradeAOutputQuantity,
+        gradeBOutputQuantity: payload.gradeBOutputQuantity,
+      });
+
+      const updatedBatch: ProductionBatch = {
+        ...promptBatch,
+        status: 'ready',
+        readyAt: new Date(),
+        driedOutputQuantity: payload.driedOutputQuantity,
+        driedOutputUnit: payload.driedOutputUnit,
+        gradeAOutputQuantity: payload.gradeAOutputQuantity,
+        gradeBOutputQuantity: payload.gradeBOutputQuantity,
+        yieldPercentage: result.yieldPercentage,
+        statusNotes: payload.notes,
+        updatedAt: new Date(),
+      };
+
+      onBatchUpdated(updatedBatch);
+
+      setReadyModalData({
+        batch: updatedBatch,
+        slackNotified: Boolean(result.notifiedSlack),
+      });
+
+      setPromptBatch(null);
+    } catch (err: any) {
+      console.error('Error marking batch ready with dried leaf weight:', err);
+      alert('Failed to record dried leaf weight: ' + (err?.message || 'Server error'));
+    } finally {
+      setIsSubmittingPromptReady(false);
+    }
+  };
+
+  // QC Reading Handler (invoked by QualityControlTimeline)
+  const handleAddQcReading = async (
+    batch: ProductionBatch,
+    reading: { metric: string; note: string }
+  ) => {
+    if (!canUpdateQuality(member.roleLabel, member.permissionTier)) {
+      setFeedback({
+        type: 'error',
+        message: 'Access Denied: Quality Control updates are restricted to Quality Inspectors and Admins.',
+      });
+      return;
+    }
+
+    setIsSubmittingReading((prev) => ({ ...prev, [batch.id]: true }));
+    try {
+      await addProgressReading(farmId, batch.id, batch.progressReadings || [], {
+        note: reading.note,
+        metric: reading.metric,
+        loggedByUid: user.uid,
+        loggedByName: user.displayName || user.email || 'QC Inspector',
+        loggedByRole:
+          member.roleLabel ||
+          (member.permissionTier === 'admin' ? 'Admin' : 'Quality Control Worker'),
+      });
+
+      const updatedReadings = [
+        ...(batch.progressReadings || []),
+        {
+          id: 'read_' + Date.now(),
+          timestamp: new Date().toISOString(),
+          note: reading.note,
+          metric: reading.metric,
+          loggedByUid: user.uid,
+          loggedByName: user.displayName || user.email || 'QC Inspector',
+          loggedByRole:
+            member.roleLabel ||
+            (member.permissionTier === 'admin' ? 'Admin' : 'Quality Control Worker'),
+        },
+      ];
+
+      onBatchUpdated({ ...batch, progressReadings: updatedReadings });
+    } catch (err: any) {
+      console.error('Error logging QC reading:', err);
+      alert('Failed to log QC reading: ' + (err?.message || 'Server error'));
+    } finally {
+      setIsSubmittingReading((prev) => ({ ...prev, [batch.id]: false }));
+    }
+  };
+
+  const getStatusBadge = (status: BatchStatus) => {
+    switch (status) {
+      case 'harvested':
+        return (
+          <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300 border border-amber-300 dark:border-amber-800">
+            Intake / Harvested
+          </span>
+        );
+      case 'processing':
+        return (
+          <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-sky-100 dark:bg-sky-950 text-sky-800 dark:text-sky-300 border border-sky-300 dark:border-sky-800 flex items-center space-x-1">
+            <Activity className="w-3 h-3 animate-pulse" />
+            <span>In Processing</span>
+          </span>
+        );
+      case 'ready':
+        return (
+          <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-100 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-800 flex items-center space-x-1">
+            <CheckCircle2 className="w-3 h-3" />
+            <span>Ready for Distribution</span>
+          </span>
+        );
+      case 'packaged':
+        return (
+          <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-purple-100 dark:bg-purple-950 text-purple-800 dark:text-purple-300 border border-purple-300 dark:border-purple-800 flex items-center space-x-1">
+            <Truck className="w-3 h-3" />
+            <span>Packaged &amp; Dispatched</span>
+          </span>
+        );
+    }
+  };
+
+  const isQC = isQualityInspector(member.roleLabel, member.permissionTier);
+  const isLead = isProductionLead(member.roleLabel, member.permissionTier);
+  const isAdmin = member.permissionTier === 'admin';
+  const canLogQc = canUpdateQuality(member.roleLabel, member.permissionTier);
+  const canMarkReady = canMarkBatchReady(member.roleLabel, member.permissionTier);
+  const canStartBatch = canStartProductionBatch(member.roleLabel, member.permissionTier);
+
+  return (
+    <div className="space-y-6">
+      {/* Quality Inspector Oversight & Authority Banner */}
+      {isQC && (
+        <div id="banner-qc-inspector" className="p-4 rounded-xl bg-emerald-50 dark:bg-emerald-950/50 border border-emerald-300 dark:border-emerald-800 text-emerald-900 dark:text-emerald-200 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
+          <div className="flex items-start sm:items-center space-x-2.5">
+            <ShieldCheck className="w-5 h-5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+            <div className="space-y-0.5">
+              <p className="font-bold text-emerald-950 dark:text-emerald-100">
+                Quality Inspector Control Panel
+              </p>
+              <p className="text-emerald-800 dark:text-emerald-300">
+                You and Facility Admins have identical authoritative control to certify batch condition parameters and <strong>Mark Batch Ready</strong> for distribution. You also hold exclusive authority to record certified <strong>Log QC Check</strong> inspection readings.
+              </p>
+            </div>
+          </div>
+          <span className="px-2.5 py-1 rounded-full bg-emerald-200 dark:bg-emerald-900 text-emerald-900 dark:text-emerald-200 font-bold text-[11px] uppercase tracking-wider self-start sm:self-auto shrink-0">
+            QC &amp; Batch Ready Authority
+          </span>
+        </div>
+      )}
+
+      {/* Production Lead Operational Oversight & Material Readiness Card */}
+      {isLead && !isAdmin && (
+        <div id="card-prod-lead-overview" className="p-4 rounded-xl bg-sky-50 dark:bg-sky-950/50 border border-sky-300 dark:border-sky-800 text-sky-900 dark:text-sky-200 text-xs space-y-3 shadow-xs">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-sky-200 dark:border-sky-800/80 pb-2.5">
+            <div className="flex items-center space-x-2.5">
+              <Boxes className="w-5 h-5 text-sky-600 dark:text-sky-400 shrink-0" />
+              <div>
+                <h3 className="font-bold text-sm text-sky-950 dark:text-sky-100">
+                  Production Lead Control &amp; Material Readiness
+                </h3>
+                <p className="text-[11px] text-sky-700 dark:text-sky-300">
+                  Monitor active processing runs, inspect available raw intake material, start new batches, and authorize Batch Ready.
+                </p>
+              </div>
+            </div>
+            <span className="px-2.5 py-1 rounded-full bg-sky-200 dark:bg-sky-900 text-sky-900 dark:text-sky-200 font-bold text-[11px] uppercase tracking-wider self-start sm:self-auto shrink-0">
+              Production Lead
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1">
+            {/* 1. What's Processing */}
+            <div className="bg-white/90 dark:bg-slate-900/90 p-3 rounded-lg border border-sky-100 dark:border-sky-900 space-y-1">
+              <div className="flex items-center justify-between text-slate-500 dark:text-slate-400 text-[11px]">
+                <span>Currently In Processing</span>
+                <Clock className="w-3.5 h-3.5 text-sky-500" />
+              </div>
+              <div className="text-lg font-bold text-slate-900 dark:text-white">
+                {processingBatches.length} {processingBatches.length === 1 ? 'Batch' : 'Batches'}
+              </div>
+              <p className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
+                {processingBatches.length > 0
+                  ? processingBatches.map((b) => b.productName).slice(0, 2).join(', ') + (processingBatches.length > 2 ? '...' : '')
+                  : 'No batches actively in dehydration chambers'}
+              </p>
+            </div>
+
+            {/* 2. Available Raw Material Stock */}
+            <div className="bg-white/90 dark:bg-slate-900/90 p-3 rounded-lg border border-sky-100 dark:border-sky-900 space-y-1">
+              <div className="flex items-center justify-between text-slate-500 dark:text-slate-400 text-[11px]">
+                <span>Available Raw Material</span>
+                <ClipboardList className="w-3.5 h-3.5 text-emerald-500" />
+              </div>
+              <div className="text-lg font-bold text-slate-900 dark:text-white">
+                {availableRawMaterials.totalAvailable > 0 ? (
+                  <span className="text-emerald-600 dark:text-emerald-400">
+                    {availableRawMaterials.totalAvailable} kg in stock
+                  </span>
+                ) : (
+                  <span className="text-amber-600 dark:text-amber-400">
+                    0 kg available
+                  </span>
+                )}
+              </div>
+              <p className="text-[10px] text-slate-500 dark:text-slate-400">
+                {availableRawMaterials.totalAvailable > 0
+                  ? 'Requirement fulfilled: Stock ready for production run'
+                  : 'Requirement: Raw intake delivery required before run'}
+              </p>
+            </div>
+
+            {/* 3. Role Authorities Breakdown */}
+            <div className="bg-white/90 dark:bg-slate-900/90 p-3 rounded-lg border border-sky-100 dark:border-sky-900 space-y-1.5 text-[11px]">
+              <div className="font-semibold text-slate-800 dark:text-slate-200">
+                Operational Permissions:
+              </div>
+              <ul className="space-y-1 text-[10px] text-slate-600 dark:text-slate-300">
+                <li className="flex items-center space-x-1.5">
+                  <CheckCircle2 className="w-3 h-3 text-emerald-500 shrink-0" />
+                  <span><strong>Start Batch:</strong> Allowed if raw material available</span>
+                </li>
+                <li className="flex items-center space-x-1.5">
+                  <CheckCircle2 className="w-3 h-3 text-emerald-500 shrink-0" />
+                  <span><strong>Batch Ready:</strong> Full authority to mark batches Ready</span>
+                </li>
+                <li className="flex items-center space-x-1.5 text-slate-500">
+                  <ShieldAlert className="w-3 h-3 text-amber-500 shrink-0" />
+                  <span><strong>QC Checks:</strong> Certified by Quality Inspector only</span>
+                </li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Notice Banner if zero raw material intake logs exist across the facility */}
+      {harvestLogs.length === 0 && (
+        <div className="p-4 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-sm">
+          <div className="flex items-start space-x-3">
+            <ClipboardList className="w-5 h-5 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <h3 className="text-xs font-bold text-amber-900 dark:text-amber-200">
+                Raw Material Intake Required Before Starting Batches
+              </h3>
+              <p className="text-[11px] text-amber-800 dark:text-amber-300 mt-0.5">
+                Your facility does not have any raw material deliveries logged yet. Every production run must be linked to raw material intake records to track origin, quantity, and lineage.
+              </p>
+            </div>
+          </div>
+          {onNavigateTab && (
+            <button
+              type="button"
+              onClick={() => onNavigateTab('intake')}
+              className="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-500 text-white rounded-lg text-xs font-semibold shadow transition shrink-0 self-start sm:self-auto flex items-center space-x-1.5"
+            >
+              <PlusCircle className="w-3.5 h-3.5" />
+              <span>Log Raw Material Intake</span>
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Header & Create Button */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white dark:bg-slate-900 p-4 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm">
+        <div>
+          <h2 className="text-lg font-bold text-slate-900 dark:text-white flex items-center space-x-2">
+            <Boxes className="w-5 h-5 text-emerald-500" />
+            <span>Production Batches &amp; AI Schedules</span>
+          </h2>
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Grounded multi-turn AI advice, conditions monitoring, and readiness workflows
+          </p>
+        </div>
+
+        {canStartBatch ? (
+          <button
+            onClick={() => {
+              if (harvestLogs.length === 0 || !availableRawMaterials.hasAvailableStock) {
+                setFeedback({
+                  type: 'error',
+                  message:
+                    'Raw material intake required: You must have unallocated raw material available before starting a production batch.',
+                });
+                if (onNavigateTab) {
+                  onNavigateTab('intake');
+                }
+                return;
+              }
+              setShowCreateModal(true);
+              setFeedback(null);
+            }}
+            className="flex items-center space-x-1.5 px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold shadow transition self-start sm:self-auto"
+          >
+            <PlusCircle className="w-4 h-4" />
+            <span>New Production Batch</span>
+          </button>
+        ) : (
+          <div className="flex items-center space-x-2 text-xs text-slate-600 dark:text-slate-300 self-start sm:self-auto">
+            <span className="px-3 py-2 rounded-lg bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-300 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300 font-semibold flex items-center space-x-1.5">
+              <ShieldCheck className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+              <span>QC &amp; Batch Ready Oversight</span>
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Global feedback banner */}
+      {feedback && (
+        <div
+          className={`p-3.5 rounded-xl text-xs flex items-center space-x-2 ${
+            feedback.type === 'success'
+              ? 'bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300'
+              : 'bg-rose-50 dark:bg-rose-950/60 border border-rose-200 dark:border-rose-800 text-rose-800 dark:text-rose-300'
+          }`}
+        >
+          {feedback.type === 'success' ? (
+            <CheckCircle2 className="w-4 h-4 shrink-0" />
+          ) : (
+            <AlertCircle className="w-4 h-4 shrink-0" />
+          )}
+          <span>{feedback.message}</span>
+        </div>
+      )}
+
+      {/* Create Batch Modal */}
+      {showCreateModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-150">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl w-full max-w-2xl shadow-2xl overflow-hidden flex flex-col max-h-[92vh]">
+            <div className="px-6 py-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between bg-slate-50 dark:bg-slate-850">
+              <div className="flex items-center space-x-2.5">
+                <div className="w-9 h-9 rounded-xl bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 flex items-center justify-center">
+                  <Sparkles className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-base text-slate-900 dark:text-white">
+                    Initialize Batch &amp; AI Schedule
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    Gemini generates precision criteria for your specific conditions
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowCreateModal(false)}
+                className="text-slate-400 hover:text-slate-700 dark:hover:text-white text-xs px-2 py-1 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-800"
+              >
+                Cancel
+              </button>
+            </div>
+
+            <form onSubmit={handleCreateBatch} className="p-6 overflow-y-auto space-y-4 text-xs">
+              {/* Product selector */}
+              <div className="space-y-1">
+                <label className="block font-semibold text-slate-700 dark:text-slate-300">
+                  Target Product from Catalog
+                </label>
+                <select
+                  value={selectedProductId}
+                  onChange={(e) => handleProductChange(e.target.value)}
+                  className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white text-xs focus:ring-2 focus:ring-emerald-500"
+                >
+                  {products.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} ({p.unit} • {p.processingType})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Linked Harvest Logs Checklist & Raw Material Intake Enforcement */}
+              {availableLogs.length === 0 ? (
+                <div className="p-4 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-800 space-y-2.5">
+                  <div className="flex items-start space-x-2.5">
+                    <AlertCircle className="w-5 h-5 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                    <div>
+                      <h4 className="text-xs font-bold text-amber-900 dark:text-amber-200">
+                        Raw Material Intake Required
+                      </h4>
+                      <p className="text-[11px] text-amber-800 dark:text-amber-300 mt-0.5 leading-relaxed">
+                        No raw material intake deliveries have been recorded for{' '}
+                        <strong>{selectedProduct?.name || 'this product'}</strong>. A production batch cannot be initiated without an intake update.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowCreateModal(false);
+                      if (onNavigateTab) {
+                        onNavigateTab('intake');
+                      }
+                    }}
+                    className="inline-flex items-center space-x-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white rounded-lg text-xs font-semibold shadow transition"
+                  >
+                    <PlusCircle className="w-3.5 h-3.5" />
+                    <span>Log Raw Material Intake First</span>
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-2 p-3.5 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
+                  <div className="flex items-center justify-between">
+                    <span className="block font-semibold text-slate-800 dark:text-slate-200 flex items-center space-x-1.5">
+                      <Scale className="w-3.5 h-3.5 text-emerald-500" />
+                      <span>Link Raw Material Intake Records (Required *):</span>
+                    </span>
+                    <span className="text-[11px] text-slate-500 font-medium">
+                      {selectedLogIds.length} of {availableLogs.length} selected
+                    </span>
+                  </div>
+
+                  <p className="text-[10px] text-slate-500 dark:text-slate-400">
+                    Select intake delivery records and specify how much quantity to draw for this batch (supports partial draws):
+                  </p>
+
+                  <div className="max-h-64 overflow-y-auto space-y-2 pr-1">
+                    {availableLogs.map((log) => {
+                      const maxAvailable = getLogAvailableQuantity(log);
+                      const isApproved = isRawMaterialApproved(log);
+                      const isExhausted = maxAvailable <= 0;
+                      const isDisabled = isExhausted || !isApproved;
+                      const isSelected = selectedLogIds.includes(log.id);
+                      const allocatedAmt =
+                        logAllocations[log.id] !== undefined
+                          ? logAllocations[log.id]
+                          : maxAvailable;
+                      const remainingAfter = Math.max(
+                        0,
+                        Math.round((maxAvailable - (Number(allocatedAmt) || 0)) * 100) / 100
+                      );
+
+                      return (
+                        <div
+                          key={log.id}
+                          className={`p-2.5 rounded-xl border transition text-[11px] ${
+                            isDisabled
+                              ? 'bg-slate-50 dark:bg-slate-900/50 border-slate-200 dark:border-slate-800 opacity-60'
+                              : isSelected
+                              ? 'bg-emerald-50/70 dark:bg-emerald-950/40 border-emerald-300 dark:border-emerald-800 text-slate-900 dark:text-white shadow-xs'
+                              : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-400 hover:border-slate-300'
+                          }`}
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <label className="flex items-start space-x-2.5 cursor-pointer flex-1">
+                              <input
+                                type="checkbox"
+                                disabled={isDisabled}
+                                checked={isSelected && !isDisabled}
+                                title={
+                                  !isApproved
+                                    ? 'Quality Inspector verification required before raw material can be batched'
+                                    : isExhausted
+                                    ? 'All material allocated'
+                                    : 'Select intake'
+                                }
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setSelectedLogIds([...selectedLogIds, log.id]);
+                                    setLogAllocations((prev) => ({
+                                      ...prev,
+                                      [log.id]: prev[log.id] ?? maxAvailable,
+                                    }));
+                                  } else {
+                                    setSelectedLogIds(selectedLogIds.filter((id) => id !== log.id));
+                                  }
+                                }}
+                                className={`rounded text-emerald-600 focus:ring-emerald-500 w-4 h-4 mt-0.5 ${
+                                  isDisabled ? 'opacity-30 cursor-not-allowed' : 'cursor-pointer'
+                                }`}
+                              />
+                              <div>
+                                <div className="font-semibold text-slate-900 dark:text-white flex items-center space-x-1.5">
+                                  <span>
+                                    {log.quantity} {formatUnitDisplay(log.unit)} delivery
+                                  </span>
+                                  <span className="font-normal text-slate-500">
+                                    — {log.notes || 'Intake delivery'}
+                                  </span>
+                                </div>
+                                <div className="text-[10px] text-slate-400 mt-0.5">
+                                  Logged by {log.loggedByName || 'Staff'} ({log.loggedByRole || 'Team'}) •{' '}
+                                  {log.harvestedAt?.toDate
+                                    ? log.harvestedAt.toDate().toLocaleDateString()
+                                    : 'Recent intake'}
+                                </div>
+                              </div>
+                            </label>
+
+                            <div className="flex items-center space-x-1.5 shrink-0 flex-wrap justify-end gap-1">
+                              {/* QC Status Badge */}
+                              {isApproved ? (
+                                <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-300 font-semibold border border-emerald-300 dark:border-emerald-800 flex items-center space-x-1">
+                                  <CheckCircle2 className="w-2.5 h-2.5 text-emerald-600" />
+                                  <span>QC Approved</span>
+                                </span>
+                              ) : log.qcStatus === 'quarantined' ? (
+                                <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300 font-semibold border border-amber-300 dark:border-amber-800 flex items-center space-x-1">
+                                  <AlertCircle className="w-2.5 h-2.5 text-amber-600" />
+                                  <span>Quarantined (Hold)</span>
+                                </span>
+                              ) : log.qcStatus === 'rejected' ? (
+                                <span className="text-[10px] px-2 py-0.5 rounded-full bg-rose-100 dark:bg-rose-950 text-rose-800 dark:text-rose-300 font-semibold border border-rose-300 dark:border-rose-800 flex items-center space-x-1">
+                                  <AlertCircle className="w-2.5 h-2.5 text-rose-600" />
+                                  <span>QC Rejected</span>
+                                </span>
+                              ) : (
+                                <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-50 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 font-semibold border border-amber-200 dark:border-amber-800 flex items-center space-x-1">
+                                  <Clock className="w-2.5 h-2.5 text-amber-500" />
+                                  <span>Pending QC</span>
+                                </span>
+                              )}
+
+                              {isExhausted ? (
+                                <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-500 font-medium">
+                                  Exhausted (All used)
+                                </span>
+                              ) : maxAvailable < log.quantity ? (
+                                <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300 font-semibold border border-amber-300 dark:border-amber-800">
+                                  {maxAvailable} {formatUnitDisplay(log.unit)} left
+                                </span>
+                              ) : (
+                                <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300 font-medium">
+                                  {log.quantity} {formatUnitDisplay(log.unit)} in stock
+                                </span>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Interactive Draw / Allocation Sub-panel for checked intake */}
+                          {isSelected && !isExhausted && (
+                            <div className="mt-2.5 pt-2 border-t border-emerald-200 dark:border-emerald-800/60 pl-6 space-y-1.5">
+                              <div className="flex flex-wrap items-center justify-between gap-1">
+                                <label className="text-[11px] font-semibold text-slate-800 dark:text-slate-200">
+                                  Draw quantity for this batch ({formatUnitDisplay(log.unit)}):
+                                </label>
+                                <span className="text-[10px] text-slate-500">
+                                  Max available: <strong>{maxAvailable} {formatUnitDisplay(log.unit)}</strong>
+                                </span>
+                              </div>
+
+                              <div className="flex flex-wrap items-center gap-2">
+                                <input
+                                  type="number"
+                                  min="0.1"
+                                  max={maxAvailable}
+                                  step="any"
+                                  value={allocatedAmt}
+                                  onChange={(e) => {
+                                    const val = parseFloat(e.target.value);
+                                    const clamped = isNaN(val)
+                                      ? 0
+                                      : Math.max(0, Math.min(maxAvailable, val));
+                                    setLogAllocations((prev) => ({
+                                      ...prev,
+                                      [log.id]: clamped,
+                                    }));
+                                  }}
+                                  className="w-28 px-2.5 py-1 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white font-bold focus:ring-2 focus:ring-emerald-500"
+                                />
+                                <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+                                  {formatUnitDisplay(log.unit)}
+                                </span>
+
+                                {/* Dynamic percentage shortcuts */}
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setLogAllocations((prev) => ({
+                                      ...prev,
+                                      [log.id]: maxAvailable,
+                                    }));
+                                  }}
+                                  className="px-2 py-0.5 text-[10px] font-semibold bg-emerald-100 dark:bg-emerald-950/80 hover:bg-emerald-200 text-emerald-800 dark:text-emerald-300 rounded border border-emerald-300 dark:border-emerald-700 transition"
+                                >
+                                  100% (All {maxAvailable})
+                                </button>
+                                {maxAvailable >= 10 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const threeFourths = Math.round((maxAvailable * 0.75) * 10) / 10;
+                                      setLogAllocations((prev) => ({
+                                        ...prev,
+                                        [log.id]: threeFourths,
+                                      }));
+                                    }}
+                                    className="px-2 py-0.5 text-[10px] font-medium bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 rounded border border-slate-200 dark:border-slate-700 transition"
+                                  >
+                                    75% ({Math.round((maxAvailable * 0.75) * 10) / 10})
+                                  </button>
+                                )}
+                                {maxAvailable >= 4 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const half = Math.round((maxAvailable * 0.5) * 10) / 10;
+                                      setLogAllocations((prev) => ({
+                                        ...prev,
+                                        [log.id]: half,
+                                      }));
+                                    }}
+                                    className="px-2 py-0.5 text-[10px] font-medium bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 rounded border border-slate-200 dark:border-slate-700 transition"
+                                  >
+                                    50% ({Math.round((maxAvailable * 0.5) * 10) / 10})
+                                  </button>
+                                )}
+                                {maxAvailable >= 10 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const quarter = Math.round((maxAvailable * 0.25) * 10) / 10;
+                                      setLogAllocations((prev) => ({
+                                        ...prev,
+                                        [log.id]: quarter,
+                                      }));
+                                    }}
+                                    className="px-2 py-0.5 text-[10px] font-medium bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 rounded border border-slate-200 dark:border-slate-700 transition"
+                                  >
+                                    25% ({Math.round((maxAvailable * 0.25) * 10) / 10})
+                                  </button>
+                                )}
+                              </div>
+
+                              <div className="text-[10px] text-slate-500 dark:text-slate-400">
+                                Allocating <strong>{allocatedAmt} {formatUnitDisplay(log.unit)}</strong> →{' '}
+                                <strong className="text-emerald-600 dark:text-emerald-400 font-semibold">
+                                  {remainingAfter} {formatUnitDisplay(log.unit)}
+                                </strong>{' '}
+                                will remain in intake inventory for future batches
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="flex items-center justify-between pt-2 border-t border-slate-200 dark:border-slate-800 text-xs">
+                    <span className="text-slate-600 dark:text-slate-400 font-medium">
+                      Derived Total Batch Quantity:
+                    </span>
+                    <span
+                      className={`font-bold ${
+                        calculatedQuantity > 0
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : 'text-rose-500'
+                      }`}
+                    >
+                      {calculatedQuantity} {selectedProduct?.unit}
+                    </span>
+                  </div>
+
+                  {selectedLogIds.length === 0 && (
+                    <p className="text-[11px] text-amber-600 dark:text-amber-400 font-semibold flex items-center space-x-1 mt-1">
+                      <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                      <span>Please check at least one intake delivery record above to proceed.</span>
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {/* Environmental conditions */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                <div className="space-y-1">
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300">
+                    Operating Temperature
+                  </label>
+                  <input
+                    type="text"
+                    value={temperature}
+                    onChange={(e) => setTemperature(e.target.value)}
+                    placeholder="e.g. 52°C controlled, 28°C ambient"
+                    className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300">
+                    Humidity / Moisture Target
+                  </label>
+                  <input
+                    type="text"
+                    value={humidity}
+                    onChange={(e) => setHumidity(e.target.value)}
+                    placeholder="e.g. < 25% RH, Ambient 60%"
+                    className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300">
+                    Method &amp; Equipment
+                  </label>
+                  <input
+                    type="text"
+                    value={method}
+                    onChange={(e) => setMethod(e.target.value)}
+                    placeholder="e.g. Multi-tray dehydrator, Stone burr grinder"
+                    className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300">
+                    Estimated Duration
+                  </label>
+                  <input
+                    type="text"
+                    value={duration}
+                    onChange={(e) => setDuration(e.target.value)}
+                    placeholder="e.g. 24-36 hrs, 14 days"
+                    className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
+                  />
+                </div>
+
+                <div className="space-y-1 sm:col-span-2">
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300">
+                    Specific Quality Criteria / Completion Checkpoints
+                  </label>
+                  <input
+                    type="text"
+                    value={targetCriteria}
+                    onChange={(e) => setTargetCriteria(e.target.value)}
+                    placeholder="e.g. Brittle stem snap, moisture < 7%, pH < 4.1"
+                    className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
+                  />
+                </div>
+              </div>
+
+              {/* AI Schedule Generator Callout */}
+              <div className="p-4 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center space-x-2 font-bold text-emerald-900 dark:text-emerald-300">
+                    <Bot className="w-4 h-4" />
+                    <span>Gemini 3.6 Flash Processing Schedule</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleGenerateAISchedule}
+                    disabled={isGeneratingAI}
+                    className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg font-semibold flex items-center space-x-1.5 shadow transition"
+                  >
+                    {isGeneratingAI ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <span>Generating...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="w-3.5 h-3.5" />
+                        <span>Generate Schedule</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                {generatedSchedule ? (
+                  <div className="p-3 bg-white dark:bg-slate-900 rounded-lg border border-emerald-300 dark:border-emerald-800/80 max-h-48 overflow-y-auto text-[11px] prose prose-xs dark:prose-invert">
+                    <ReactMarkdown>{generatedSchedule}</ReactMarkdown>
+                  </div>
+                ) : (
+                  <p className="text-[11px] text-emerald-800 dark:text-emerald-400">
+                    Click "Generate Schedule" to compute optimal monitoring checkpoints, sensory thresholds, and environmental control points for {selectedProduct?.name || 'this product'}.
+                  </p>
+                )}
+              </div>
+
+              {/* Submit Buttons */}
+              <div className="pt-3 border-t border-slate-200 dark:border-slate-800 space-y-2">
+                <div className="flex items-center justify-between">
+                  <div>
+                    {selectedLogIds.length === 0 ? (
+                      <span className="text-[11px] text-amber-600 dark:text-amber-400 font-medium flex items-center space-x-1">
+                        <AlertCircle className="w-3.5 h-3.5" />
+                        <span>Link at least one raw material intake record to launch</span>
+                      </span>
+                    ) : (
+                      <span className="text-[11px] text-emerald-600 dark:text-emerald-400 font-medium flex items-center space-x-1">
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        <span>
+                          {calculatedQuantity} {selectedProduct?.unit} ready to launch
+                        </span>
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex items-center space-x-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowCreateModal(false)}
+                      className="px-4 py-2 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-xl"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={
+                        isCreatingBatch ||
+                        !selectedProduct ||
+                        selectedLogIds.length === 0 ||
+                        calculatedQuantity <= 0
+                      }
+                      className="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold rounded-xl shadow flex items-center space-x-2 transition"
+                    >
+                      {isCreatingBatch ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          <span>Saving Batch &amp; Schedule...</span>
+                        </>
+                      ) : (
+                        <>
+                          <PlusCircle className="w-4 h-4" />
+                          <span>Launch Production Batch</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Batch Schedule Drawer / Modal */}
+      {viewingScheduleBatch && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-150">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl w-full max-w-2xl shadow-2xl overflow-hidden flex flex-col max-h-[88vh]">
+            <div className="px-6 py-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between bg-slate-50 dark:bg-slate-850">
+              <div className="flex items-center space-x-2">
+                <FileText className="w-5 h-5 text-emerald-500" />
+                <h3 className="font-bold text-sm sm:text-base text-slate-900 dark:text-white">
+                  Schedule: {viewingScheduleBatch.productName}
+                </h3>
+              </div>
+              <button
+                onClick={() => setViewingScheduleBatch(null)}
+                className="text-xs px-2 py-1 text-slate-400 hover:text-slate-700 dark:hover:text-white"
+              >
+                Close
+              </button>
+            </div>
+            <div className="p-6 overflow-y-auto prose prose-xs dark:prose-invert max-w-none text-slate-800 dark:text-slate-200">
+              <ReactMarkdown>{viewingScheduleBatch.schedule}</ReactMarkdown>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Status Filter Tabs */}
+      <div className="flex items-center justify-between gap-2 border-b border-slate-200 dark:border-slate-800 pb-2 overflow-x-auto">
+        <div className="flex items-center space-x-1.5 sm:space-x-2 shrink-0">
+          <button
+            type="button"
+            onClick={() => setStatusFilter('all')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition shrink-0 ${
+              statusFilter === 'all'
+                ? 'bg-slate-900 dark:bg-white text-white dark:text-slate-900 shadow-xs'
+                : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
+            }`}
+          >
+            All Batches ({batches.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setStatusFilter('processing')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition shrink-0 flex items-center space-x-1.5 ${
+              statusFilter === 'processing'
+                ? 'bg-sky-600 text-white shadow-xs'
+                : 'text-sky-700 dark:text-sky-300 hover:bg-sky-50 dark:hover:bg-sky-950/60'
+            }`}
+          >
+            <Clock className="w-3.5 h-3.5" />
+            <span>Processing ({processingBatches.length})</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setStatusFilter('ready')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition shrink-0 flex items-center space-x-1.5 ${
+              statusFilter === 'ready'
+                ? 'bg-emerald-600 text-white shadow-xs'
+                : 'text-emerald-700 dark:text-emerald-300 hover:bg-emerald-50 dark:hover:bg-emerald-950/60'
+            }`}
+          >
+            <CheckCircle2 className="w-3.5 h-3.5" />
+            <span>Ready ({readyBatches.length})</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setStatusFilter('packaged')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition shrink-0 flex items-center space-x-1.5 ${
+              statusFilter === 'packaged'
+                ? 'bg-purple-600 text-white shadow-xs'
+                : 'text-purple-700 dark:text-purple-300 hover:bg-purple-50 dark:hover:bg-purple-950/60'
+            }`}
+          >
+            <Truck className="w-3.5 h-3.5" />
+            <span>Packaged ({packagedBatches.length})</span>
+          </button>
+        </div>
+
+        {statusFilter !== 'all' && (
+          <button
+            type="button"
+            onClick={() => setStatusFilter('all')}
+            className="text-[11px] text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 underline shrink-0"
+          >
+            Show All
+          </button>
+        )}
+      </div>
+
+      {/* Active Batches List */}
+      {batches.length === 0 ? (
+        <div className="text-center py-12 bg-white dark:bg-slate-900 border border-dashed border-slate-300 dark:border-slate-800 rounded-xl p-8">
+          <Boxes className="w-10 h-10 text-slate-400 mx-auto mb-2" />
+          <h3 className="text-sm font-semibold text-slate-800 dark:text-slate-200">
+            No active batches running
+          </h3>
+          <p className="text-xs text-slate-500 mt-1 max-w-sm mx-auto">
+            Launch a production batch from your raw intake to compute Gemini processing schedules.
+          </p>
+          {canStartBatch && (
+            <button
+              onClick={() => setShowCreateModal(true)}
+              className="mt-3 px-3 py-1.5 text-xs font-medium bg-emerald-600 text-white rounded-lg hover:bg-emerald-500 transition"
+            >
+              + Create First Batch
+            </button>
+          )}
+        </div>
+      ) : filteredBatches.length === 0 ? (
+        <div className="text-center py-10 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6">
+          <Boxes className="w-8 h-8 text-slate-400 mx-auto mb-2" />
+          <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">
+            No batches found in "{statusFilter}" status
+          </h3>
+          <p className="text-xs text-slate-500 mt-1">
+            Switch filter or click below to view all batches.
+          </p>
+          <button
+            type="button"
+            onClick={() => setStatusFilter('all')}
+            className="mt-3 px-3 py-1.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-slate-700 dark:text-slate-300 rounded-lg transition"
+          >
+            View All Batches
+          </button>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {filteredBatches.map((batch) => {
+            const isExpanded = expandedBatchId === batch.id;
+            const readingCount = batch.progressReadings?.length || 0;
+
+            return (
+              <div
+                key={batch.id}
+                className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl shadow-sm overflow-hidden transition"
+              >
+                {/* Batch Card Header */}
+                <div className="p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 dark:border-slate-800/80">
+                  <div>
+                    <div className="flex items-center space-x-2.5">
+                      <h3 className="font-bold text-base text-slate-900 dark:text-white">
+                        {batch.productName}
+                      </h3>
+                      {getStatusBadge(batch.status)}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1.5 text-xs text-slate-500 dark:text-slate-400">
+                      <span>Batch #{batch.id.slice(-6)}</span>
+                      <span>•</span>
+                      <span>Raw: <strong className="text-slate-700 dark:text-slate-200">{batch.totalQuantity} {batch.unit}</strong></span>
+                      {batch.driedOutputQuantity !== undefined && (
+                        <>
+                          <span>•</span>
+                          <span className="text-emerald-700 dark:text-emerald-300 font-semibold">
+                            Dried: {batch.driedOutputQuantity} {batch.driedOutputUnit || batch.unit}
+                            {batch.yieldPercentage ? ` (${batch.yieldPercentage}% yield)` : ''}
+                          </span>
+                        </>
+                      )}
+                      {(batch.gradeAOutputQuantity !== undefined || batch.gradeBOutputQuantity !== undefined) && (
+                        <>
+                          <span>•</span>
+                          <span className="px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-300 font-semibold text-[11px]">
+                            Grade A: {batch.gradeAOutputQuantity || 0} {batch.driedOutputUnit || batch.unit}
+                          </span>
+                          <span className="px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300 font-semibold text-[11px]">
+                            Grade B: {batch.gradeBOutputQuantity || 0} {batch.driedOutputUnit || batch.unit}
+                          </span>
+                        </>
+                      )}
+                      <span>•</span>
+                      <span className="capitalize">{batch.processingType}</span>
+                    </div>
+                  </div>
+
+                  {/* Actions Strip */}
+                  <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
+                    {/* Log Quality Control Temperature & Condition Check Button (Admin & Quality Inspector) */}
+                    {canLogQc && (
+                      <button
+                        id={`btn-log-qc-action-${batch.id}`}
+                        onClick={() => setExpandedBatchId(batch.id)}
+                        className="px-3 py-1.5 bg-rose-600 hover:bg-rose-500 text-white rounded-lg text-xs font-bold transition flex items-center space-x-1.5 shadow-sm"
+                        title="Log Quality Control Temperature & Condition Check"
+                      >
+                        <Thermometer className="w-3.5 h-3.5 text-white" />
+                        <span>Log QC Check</span>
+                      </button>
+                    )}
+
+                    {/* Quality Control Temperature & Timeline View Button */}
+                    <button
+                      onClick={() => setExpandedBatchId(isExpanded ? null : batch.id)}
+                      className="px-2.5 py-1.5 bg-rose-50 dark:bg-rose-950/60 hover:bg-rose-100 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800 rounded-lg text-xs font-medium transition flex items-center space-x-1"
+                      title="Quality Control: View temperature maintained & timeline checking"
+                    >
+                      <Activity className="w-3.5 h-3.5 text-rose-500" />
+                      <span>QC Timeline</span>
+                    </button>
+
+                    {/* "Ask AI" Multi-turn consultation button */}
+                    <button
+                      onClick={() => setActiveChatBatch(batch)}
+                      className="px-3 py-1.5 bg-emerald-50 dark:bg-emerald-950/60 hover:bg-emerald-100 text-emerald-700 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-800 rounded-lg text-xs font-semibold transition flex items-center space-x-1.5 shadow-sm"
+                    >
+                      <Bot className="w-3.5 h-3.5" />
+                      <span>Ask AI</span>
+                    </button>
+
+                    {/* View Schedule Button */}
+                    <button
+                      onClick={() => setViewingScheduleBatch(batch)}
+                      className="px-2.5 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg text-xs font-medium transition flex items-center space-x-1"
+                    >
+                      <FileText className="w-3.5 h-3.5" />
+                      <span>Schedule</span>
+                    </button>
+
+                    {/* Expand/Collapse Readings */}
+                    <button
+                      onClick={() => setExpandedBatchId(isExpanded ? null : batch.id)}
+                      className="p-1.5 text-slate-400 hover:text-slate-700 dark:hover:text-white rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800"
+                    >
+                      {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Batch Conditions Snapshot */}
+                <div className="px-5 py-3 bg-slate-50 dark:bg-slate-950/50 text-xs text-slate-600 dark:text-slate-400 grid grid-cols-2 sm:grid-cols-4 gap-3 border-b border-slate-100 dark:border-slate-800">
+                  <div className="flex items-center space-x-1.5">
+                    <Thermometer className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                    <span>Temp: <strong className="text-slate-800 dark:text-slate-200">{batch.conditions.temperature || 'Ambient'}</strong></span>
+                  </div>
+                  <div className="flex items-center space-x-1.5">
+                    <Droplets className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                    <span>RH: <strong className="text-slate-800 dark:text-slate-200">{batch.conditions.humidity || 'Standard'}</strong></span>
+                  </div>
+                  <div className="flex items-center space-x-1.5">
+                    <Clock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span>Duration: <strong className="text-slate-800 dark:text-slate-200">{batch.conditions.duration || 'Flexible'}</strong></span>
+                  </div>
+                  <div className="flex items-center space-x-1.5">
+                    <Activity className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    <span>Readings: <strong className="text-slate-800 dark:text-slate-200">{readingCount}</strong></span>
+                  </div>
+                </div>
+
+                {/* Expanded Details: Progress Readings & Status Transitions */}
+                {isExpanded && (
+                  <div className="p-5 space-y-5 bg-white dark:bg-slate-900">
+                    {/* Status Lifecycle Controls */}
+                    <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-850 border border-slate-200 dark:border-slate-800 space-y-3">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+                        <div className="flex items-center space-x-2 text-xs font-bold text-slate-800 dark:text-slate-200">
+                          {canMarkReady ? (
+                            <ShieldCheck className="w-4 h-4 text-emerald-500" />
+                          ) : (
+                            <ShieldAlert className="w-4 h-4 text-amber-500" />
+                          )}
+                          <span>Batch Status Lifecycle</span>
+                        </div>
+                        <span className="text-[10px] text-slate-500 dark:text-slate-400">
+                          {isAdmin
+                            ? '* Admin: Full authority on Ready & Packaged transitions'
+                            : canMarkReady
+                            ? '* Authorized: You have authority to certify and mark batch Ready'
+                            : '* Quality Inspector, Production Lead, or Admin authority required to mark Ready'}
+                        </span>
+                      </div>
+
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          onClick={() => handleStatusChange(batch, 'processing')}
+                          disabled={batch.status === 'processing' || isUpdatingStatus[batch.id]}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
+                            batch.status === 'processing'
+                              ? 'bg-sky-600 text-white'
+                              : 'bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-100'
+                          }`}
+                        >
+                          Processing
+                        </button>
+
+                        <button
+                          onClick={() => handleStatusChange(batch, 'ready')}
+                          disabled={
+                            batch.status === 'ready' ||
+                            !canMarkReady ||
+                            isUpdatingStatus[batch.id]
+                          }
+                          title={
+                            canMarkReady
+                              ? 'Mark Ready and record dried leaf weight into stock'
+                              : 'Quality Inspector, Production Lead, or Admin authority required to mark Ready'
+                          }
+                          className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition flex items-center space-x-1.5 ${
+                            batch.status === 'ready'
+                              ? 'bg-emerald-600 text-white'
+                              : canMarkReady
+                              ? 'bg-emerald-100 dark:bg-emerald-950/60 hover:bg-emerald-200 text-emerald-800 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-800 cursor-pointer'
+                              : 'opacity-40 cursor-not-allowed bg-slate-100 dark:bg-slate-800 text-slate-400 border border-slate-200 dark:border-slate-700'
+                          }`}
+                        >
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <span>Mark Ready</span>
+                        </button>
+
+                        <button
+                          onClick={() => handleStatusChange(batch, 'packaged')}
+                          disabled={
+                            batch.status === 'packaged' ||
+                            member.permissionTier !== 'admin' ||
+                            isUpdatingStatus[batch.id]
+                          }
+                          title={
+                            member.permissionTier !== 'admin'
+                              ? 'Only Admins can mark a batch Packaged'
+                              : 'Mark Packaged & Dispatched'
+                          }
+                          className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition flex items-center space-x-1.5 ${
+                            batch.status === 'packaged'
+                              ? 'bg-purple-600 text-white'
+                              : member.permissionTier === 'admin'
+                              ? 'bg-purple-100 dark:bg-purple-950/60 hover:bg-purple-200 text-purple-800 dark:text-purple-300 border border-purple-300 dark:border-purple-800'
+                              : 'opacity-40 cursor-not-allowed bg-slate-100 dark:bg-slate-800 text-slate-400 border border-slate-200 dark:border-slate-700'
+                          }`}
+                        >
+                          <Truck className="w-3.5 h-3.5" />
+                          <span>Mark Packaged</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Quality Control Temperature & Timeline Checking */}
+                    <QualityControlTimeline
+                      batch={batch}
+                      member={member}
+                      onAddReading={(reading) => handleAddQcReading(batch, reading)}
+                      isSubmitting={isSubmittingReading[batch.id]}
+                    />
+
+                    {/* General Progress Observation Logs Section */}
+                    <div className="space-y-3 pt-2">
+                      <h4 className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center space-x-1.5">
+                        <Activity className="w-3.5 h-3.5 text-emerald-500" />
+                        <span>Additional General Observations ({readingCount})</span>
+                      </h4>
+
+                      {/* Log New Reading Sub-form (Workers & Admins permitted) */}
+                      <div className="flex flex-col sm:flex-row items-center gap-2">
+                        <input
+                          type="text"
+                          placeholder="Reading / Metric (e.g. Moisture: 12%, pH 4.2, Weight: 42kg)"
+                          value={newReadingMetric[batch.id] || ''}
+                          onChange={(e) =>
+                            setNewReadingMetric((prev) => ({
+                              ...prev,
+                              [batch.id]: e.target.value,
+                            }))
+                          }
+                          className="w-full sm:w-1/3 px-3 py-1.5 text-xs bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
+                        />
+                        <input
+                          type="text"
+                          placeholder="Observation note (e.g. Rotated trays, texture crisping nicely)"
+                          value={newReadingNote[batch.id] || ''}
+                          onChange={(e) =>
+                            setNewReadingNote((prev) => ({
+                              ...prev,
+                              [batch.id]: e.target.value,
+                            }))
+                          }
+                          className="w-full sm:flex-1 px-3 py-1.5 text-xs bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
+                        />
+                        <button
+                          onClick={() => handleAddReading(batch)}
+                          disabled={
+                            isSubmittingReading[batch.id] || !(newReadingNote[batch.id] || '').trim()
+                          }
+                          className="w-full sm:w-auto px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold text-xs rounded-lg transition shrink-0"
+                        >
+                          {isSubmittingReading[batch.id] ? 'Saving...' : 'Add Reading'}
+                        </button>
+                      </div>
+
+                      {/* Readings Timeline */}
+                      {readingCount === 0 ? (
+                        <p className="text-xs text-slate-400 italic py-2">
+                          No progress readings recorded yet. Workers can log periodic moisture, temperature, or sensory checks.
+                        </p>
+                      ) : (
+                        <div className="divide-y divide-slate-100 dark:divide-slate-800 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+                          {batch.progressReadings.map((reading) => (
+                            <div
+                              key={reading.id}
+                              className="p-3 text-xs bg-slate-50/50 dark:bg-slate-950/30 flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+                            >
+                              <div>
+                                <span className="font-semibold text-slate-900 dark:text-white">
+                                  {reading.metric || 'Reading'}:
+                                </span>{' '}
+                                <span className="text-slate-700 dark:text-slate-300">
+                                  {reading.note}
+                                </span>
+                              </div>
+                              <div className="text-[11px] text-slate-400 flex items-center space-x-2 shrink-0">
+                                <span>{reading.loggedByName} ({reading.loggedByRole})</span>
+                                <span>•</span>
+                                <span>{new Date(reading.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Batch Chat Modal */}
+      {activeChatBatch && (
+        <BatchChatModal
+          farmId={farmId}
+          batch={activeChatBatch}
+          user={user}
+          member={member}
+          isOpen={!!activeChatBatch}
+          onClose={() => setActiveChatBatch(null)}
+        />
+      )}
+
+      {/* Batch Ready Confirmation & Next Steps Modal */}
+      {readyModalData && (
+        <BatchReadyModal
+          batch={readyModalData.batch}
+          isOpen={!!readyModalData}
+          slackNotified={readyModalData.slackNotified}
+          onClose={() => {
+            setReadyModalData(null);
+            setExpandedBatchId(null);
+          }}
+          onMarkPackaged={(batchToPackage) => {
+            handleStatusChange(batchToPackage, 'packaged');
+          }}
+          onOpenAiConsultation={(b) => {
+            setActiveChatBatch(b);
+          }}
+          onViewHistory={
+            onNavigateTab ? () => onNavigateTab('history') : undefined
+          }
+          onStartNextBatch={() => {
+            const freshIntakeLogs = harvestLogs.filter((l) => !exhaustedHarvestLogIds.has(l.id));
+            if (freshIntakeLogs.length > 0) {
+              setShowCreateModal(true);
+            } else if (onNavigateTab) {
+              onNavigateTab('intake');
+            } else {
+              setShowCreateModal(true);
+            }
+          }}
+        />
+      )}
+
+      {/* Prompt Modal for Entering Original Dried Leaf Weight Into Stock when Marking Ready */}
+      {promptBatch && (
+        <BatchReadyPromptModal
+          batch={promptBatch}
+          isOpen={!!promptBatch}
+          onClose={() => setPromptBatch(null)}
+          onConfirm={handleConfirmReadyPrompt}
+          isSubmitting={isSubmittingPromptReady}
+        />
+      )}
+    </div>
+  );
+};
